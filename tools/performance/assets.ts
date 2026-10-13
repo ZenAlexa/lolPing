@@ -1,5 +1,5 @@
 import { app, BrowserWindow, ipcMain, net } from 'electron';
-import { mkdir, rm, writeFile } from 'node:fs/promises';
+import { rm, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { registerAppScheme, serveAppScheme } from '../../src/main/appProtocol';
 import { allEmoteAssetFiles } from '../../src/shared/emotes';
@@ -13,6 +13,7 @@ const measureOnly = process.argv.includes('--measure');
 const timeout = setTimeout(() => { console.error('FAIL: asset scenario timed out'); app.exit(1); }, 30_000);
 const windows: BrowserWindow[] = [];
 const temporary = resolve(process.argv[3]);
+app.setPath('userData', temporary);
 
 async function waitFor(win: BrowserWindow, expression: string): Promise<void> {
   const end = performance.now() + 5000;
@@ -23,8 +24,6 @@ async function waitFor(win: BrowserWindow, expression: string): Promise<void> {
 }
 
 async function run(): Promise<void> {
-  await mkdir(temporary, { recursive: true });
-  app.setPath('userData', temporary);
   await app.whenReady();
   serveAppScheme({ rendererRoot: join(root, 'out/renderer'), emoteDirs: () => [temporary] });
   const images = allEmoteAssetFiles().filter((file) => !file.endsWith('.ogg'));
