@@ -339,6 +339,7 @@ export class RoomManager extends EventEmitter {
     this.phase = 'idle';
     this.code = this.keys = null;
     this.members.clear();
+    this.limiter.clear();
     this.answered.clear();
     this.staleStrikes.clear();
     this.lastPresence = {};

@@ -3,7 +3,10 @@ import { rm, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { registerAppScheme, serveAppScheme } from '../../src/main/appProtocol';
 import { allEmoteAssetFiles } from '../../src/shared/emotes';
+import { EMOTE_CATALOG } from '../../src/shared/emoteCatalog';
 import { OVERLAY_ASSETS, OVERLAY_PINGED } from '../../src/shared/ipc';
+import { allSoundNames } from '../../src/shared/pings';
+import { DEFAULT_SETTINGS, overlaySettings } from '../../src/shared/settings';
 
 // Uses the real protocol, production renderer and preload, with isolated data and no input hooks.
 registerAppScheme();
@@ -68,11 +71,37 @@ async function run(): Promise<void> {
       preload: join(root, 'out/preload/overlay.js'), backgroundThrottling: false, autoplayPolicy: 'no-user-gesture-required',
     } });
     windows.push(win);
+    win.webContents.setAudioMuted(true);
+    await win.loadURL('about:blank');
+    win.webContents.debugger.attach('1.3');
+    await win.webContents.debugger.sendCommand('Page.enable');
+    await win.webContents.debugger.sendCommand('Page.addScriptToEvaluateOnNewDocument', { source: `
+      const pending = new Set();
+      const schedule = window.setTimeout;
+      const cancel = window.clearTimeout;
+      window.setTimeout = (callback, delay, ...args) => {
+        const id = schedule(() => { pending.delete(id); callback(...args); }, delay);
+        pending.add(id);
+        return id;
+      };
+      window.clearTimeout = (id) => { pending.delete(id); cancel(id); };
+      const decode = AudioContext.prototype.decodeAudioData;
+      let decoded = 0;
+      AudioContext.prototype.decodeAudioData = async function(data) {
+        const buffer = await decode.call(this, data);
+        decoded++;
+        return buffer;
+      };
+      window.performanceScenario = () => ({ timers: pending.size, decoded });
+    ` });
     if (i === 0) win.webContents.session.webRequest.onBeforeRequest((details, done) => {
       if (details.url.startsWith('lolping://app/') && /\/emotes\/[^/]+\.(webp|png)$/.test(details.url)) requests.push(`${details.method} ${details.url}`);
       done({});
     });
     await win.loadURL('lolping://app/overlay/index.html');
+    const expectedSounds = allSoundNames().length + EMOTE_CATALOG.filter((emote) => emote.hasSound).length;
+    await waitFor(win, `window.performanceScenario().decoded === ${expectedSounds}`);
+    win.webContents.send('overlay:settings', overlaySettings({ ...DEFAULT_SETTINGS, muted: true }));
     await waitFor(win, 'document.querySelectorAll("#wheel .icon").length === 8');
     win.webContents.send('wheel:open', { x: 200, y: 200, wheel: 'ping' });
     await waitFor(win, 'document.querySelector("#wheel").classList.contains("open")');
@@ -83,6 +112,28 @@ async function run(): Promise<void> {
     await waitFor(win, 'Boolean(document.querySelector(".emote .sheet")?.naturalWidth)');
     win.webContents.send('emote:clear', { owner: 'self' });
     await waitFor(win, 'document.querySelector("#emotes").childElementCount === 0');
+    for (let n = 0; n < 1000; n++) {
+      win.webContents.send('ping:spawn', { id: 'danger', x: 200, y: 200, tag: { name: String(n), color: 0 } });
+      win.webContents.send('toast:show', { title: String(n), body: 'replacement' });
+    }
+    await waitFor(win, 'document.querySelector("#toasts b")?.textContent === "999"');
+    const resources = await win.webContents.executeJavaScript(`({
+      ...window.performanceScenario(), pings: document.querySelector('#pings').childElementCount,
+      toasts: document.querySelector('#toasts').childElementCount
+    })`) as { timers: number; decoded: number; pings: number; toasts: number };
+    console.log(JSON.stringify({ scenario: 'overlay burst', window: i, ...resources }));
+    if (resources.pings !== 60 || resources.toasts !== 1 || (!measureOnly && resources.timers !== 61)) {
+      throw new Error('overlay burst retained resources beyond its visible effects');
+    }
+    await waitFor(win, 'document.querySelector("#toasts .out") !== null');
+    win.webContents.send('toast:show', { title: 'replaced during fade', body: 'new lifetime' });
+    await waitFor(win, 'document.querySelector("#toasts b")?.textContent === "replaced during fade"');
+    await new Promise((done) => setTimeout(done, 300));
+    if (!await win.webContents.executeJavaScript('document.querySelector("#toasts b")?.textContent === "replaced during fade"')) {
+      throw new Error('an expired toast removed its replacement');
+    }
+    await waitFor(win, 'document.querySelector("#pings").childElementCount === 0 && document.querySelector("#toasts").childElementCount === 0');
+    if (await win.webContents.executeJavaScript('window.performanceScenario().timers !== 0')) throw new Error('effect timers survived expiry');
   }
   const headCount = requests.filter((request) => request.startsWith('HEAD ')).length;
   if (!measureOnly && headCount !== images.length * 2) throw new Error(`expected ${images.length * 2} probes, got ${headCount}`);

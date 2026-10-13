@@ -10,4 +10,5 @@ clang++ $FLAGS -O2 src/main_posix.cpp src/hooks_mac.cpp src/macinput.cpp src/sim
 clang++ $FLAGS -O0 tests/helper_tests.cpp src/decision.cpp src/commands.cpp src/macinput.cpp src/json.cpp src/output.cpp \
   -o build/helper_tests
 clang++ $FLAGS -O2 ../../tools/performance/output-scenario.cpp src/json.cpp src/output.cpp -o build/output-scenario
-echo "Built build/hook-helper, build/helper_tests and build/output-scenario"
+clang++ $FLAGS -O2 ../../tools/performance/decision-scenario.cpp src/decision.cpp -o build/decision-scenario
+echo "Built hook-helper, helper_tests, output-scenario and decision-scenario"

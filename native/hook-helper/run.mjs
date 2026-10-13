@@ -19,5 +19,5 @@ if (action !== 'build' && action !== 'test') {
 if (win) run('cmd.exe', ['/d', '/c', '.\\build.cmd']);
 else run('sh', ['build.sh']);
 if (action === 'test') {
-  for (const name of ['helper_tests', 'output-scenario']) run(join(here, 'build', win ? `${name}.exe` : name), []);
+  for (const name of ['helper_tests', 'output-scenario', 'decision-scenario']) run(join(here, 'build', win ? `${name}.exe` : name), []);
 }

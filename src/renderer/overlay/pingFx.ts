@@ -4,6 +4,13 @@ import { TAG_COLORS } from '../../shared/roomColors';
 
 /** Safety ceiling: past this many pings on screen the oldest go early, so a ping flood can't bog the overlay down. */
 export const MAX_PINGS = 60;
+const expiry = new WeakMap<Element, ReturnType<typeof setTimeout>>();
+
+function removePing(ping: Element): void {
+  clearTimeout(expiry.get(ping));
+  expiry.delete(ping);
+  ping.remove();
+}
 
 export interface PingFxOptions {
   sizePx: number;
@@ -56,7 +63,7 @@ export function spawnPing(layer: HTMLElement, def: PingDef, x: number, y: number
     tag.style.setProperty('--tag', TAG_COLORS[opts.tag.color] ?? TAG_COLORS[0]);
     root.append(tag);
   }
-  while (layer.childElementCount >= MAX_PINGS) layer.firstElementChild?.remove();
+  while (layer.childElementCount >= MAX_PINGS && layer.firstElementChild) removePing(layer.firstElementChild);
   layer.append(root);
-  setTimeout(() => root.remove(), opts.durationS * 1000 + 150);
+  expiry.set(root, setTimeout(() => removePing(root), opts.durationS * 1000 + 150));
 }

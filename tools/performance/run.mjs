@@ -7,6 +7,11 @@ import electron from 'electron';
 
 const temporary = mkdtempSync(join(tmpdir(), 'lolping-performance-'));
 try {
+  const lifecycle = join(temporary, 'main-lifecycle.cjs');
+  await build({ entryPoints: ['tools/performance/main-lifecycle.ts'], outfile: lifecycle, bundle: true, platform: 'node' });
+  const main = spawnSync(process.execPath, [lifecycle, resolve('.')], { stdio: 'inherit', timeout: 45_000 });
+  if (main.error) throw main.error;
+  if (main.status !== 0) throw new Error(`main lifecycle scenario exited with ${main.status}`);
   const data = join(temporary, 'data');
   mkdirSync(data);
   const entry = join(temporary, 'assets.cjs');
