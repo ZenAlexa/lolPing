@@ -112,8 +112,7 @@ const probe = (url: string, label: string): Promise<string | null> =>
 /** Like probe for a file that is too big to load just to check it: the emote animations come to about 50 MB. */
 async function probeHead(url: string, label: string): Promise<string | null> {
   try {
-    const res = await fetch(url);
-    void res.body?.cancel(); // the headers are enough
+    const res = await fetch(url, { method: 'HEAD' });
     return res.ok ? null : label;
   } catch {
     return label;
