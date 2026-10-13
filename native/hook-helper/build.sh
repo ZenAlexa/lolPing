@@ -9,4 +9,5 @@ clang++ $FLAGS -O2 src/main_posix.cpp src/hooks_mac.cpp src/macinput.cpp src/sim
   -framework ApplicationServices -framework CoreFoundation -o build/hook-helper
 clang++ $FLAGS -O0 tests/helper_tests.cpp src/decision.cpp src/commands.cpp src/macinput.cpp src/json.cpp src/output.cpp \
   -o build/helper_tests
-echo "Built build/hook-helper and build/helper_tests"
+clang++ $FLAGS -O2 ../../tools/performance/output-scenario.cpp src/json.cpp src/output.cpp -o build/output-scenario
+echo "Built build/hook-helper, build/helper_tests and build/output-scenario"
