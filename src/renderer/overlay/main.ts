@@ -131,7 +131,7 @@ const soundEntries = [
   ...allSoundNames().map((name) => ({ key: name, url: soundUrl(name) })),
   ...EMOTE_CATALOG.filter((e) => e.hasSound).map((e) => ({ key: `emote:${e.slug}`, url: emoteSoundUrl(e.slug) })),
 ];
-// About lists a missing file by its place in assets/ ("sounds/x.wav", "emotes/y.ogg"), not by the URL this page used.
+// About lists a missing file by its place in assets/ ("sounds/x.flac", "emotes/y.ogg"), not by the URL this page used.
 const assetName = (url: string): string => url.replace(/^(?:\.{1,2}\/)+/, '');
 
 void Promise.all([sounds.load(soundEntries), checkImages()]).then(([missingSounds, missingImages]) => {
