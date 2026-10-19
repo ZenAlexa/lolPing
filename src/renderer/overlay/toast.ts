@@ -1,4 +1,4 @@
-import { textureUrl } from '../../shared/pings';
+import { LOGO_TEXTURE, textureUrl } from '../../shared/pings';
 
 const expiry = new WeakMap<HTMLElement, ReturnType<typeof setTimeout>>();
 
@@ -8,7 +8,7 @@ export function showToast(layer: HTMLElement, title: string, body: string, ms = 
   const toast = document.createElement('div');
   toast.className = 'toast';
   const icon = document.createElement('img');
-  icon.src = textureUrl('generic_ping');
+  icon.src = textureUrl(LOGO_TEXTURE);
   const text = document.createElement('div');
   const b = document.createElement('b');
   b.textContent = title;
