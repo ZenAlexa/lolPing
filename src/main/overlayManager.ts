@@ -2,12 +2,16 @@ import { BrowserWindow, ipcMain, screen, type Display, type Rectangle, type WebC
 import { EventEmitter } from 'node:events';
 import { isEmoteRefShape, type EmoteArt, type EmoteRef } from '../shared/emotes';
 import {
-  OVERLAY_ASSETS, OVERLAY_EMOTED, OVERLAY_PINGED, type OverlayChannel, type OverlayEvents, type PingTag,
+  OVERLAY_ASSETS, OVERLAY_EMOTED, OVERLAY_IDLE, OVERLAY_PINGED, type OverlayChannel, type OverlayEvents, type PingTag,
 } from '../shared/ipc';
+import { WHEEL, pickSlice } from '../shared/geometry';
 import { isPingId, type PingId } from '../shared/pings';
 import type { HelperEvent, WheelKind } from '../shared/protocol';
 import type { OverlaySettings, RoomTextStyle } from '../shared/settings';
-import { physicalToLocal, type DisplayMap } from './coords';
+import type { Rect } from '../shared/teammate/coords';
+import {
+  displayAtPhysical, physicalBoxToLocal, physicalToDip, physicalToLocal, type DisplayMap, type LocalPoint,
+} from './coords';
 import { numberDisplays, type NumberedDisplay } from './displayNumbers';
 import { IS_LINUX, IS_MAC, loadPage, preloadPath } from './paths';
 
@@ -27,6 +31,23 @@ export interface SharedEmote {
   y: number;
 }
 
+/** An ask-wheel release on a slice whose intent is on: the wheel centre, in overlay CSS px and physical px. */
+export interface AskRelease {
+  displayId: number;
+  x: number;
+  y: number;
+  phys: { x: number; y: number };
+  id: PingId;
+}
+
+/** Ask key + click (no drag), in overlay CSS px and physical px. */
+export interface AskClick {
+  displayId: number;
+  x: number;
+  y: number;
+  phys: { x: number; y: number };
+}
+
 const isNum = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
 
 /**
@@ -36,16 +57,44 @@ const isNum = (v: unknown): v is number => typeof v === 'number' && Number.isFin
 export const overlayBounds = (d: Display): Rectangle =>
   IS_MAC || IS_LINUX ? d.bounds : { ...d.bounds, height: d.bounds.height - 1 };
 
+const overlaps = (a: Rectangle, b: Rectangle): boolean =>
+  a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height;
+
+/**
+ * Where an empty overlay waits on Windows (#127): still shown, moved off its display but for one DIP along a side no
+ * other display borders. Screenshot tools then find the windows under the pointer. Hiding it instead made Windows play
+ * its show animation each time, so the wheel slid in from the display's centre. The DIP left on the display keeps the
+ * window at that display's scale. Null when every side borders another display.
+ */
+export function parkedBounds(display: Rectangle, overlay: Rectangle, others: readonly Rectangle[]): Rectangle | null {
+  const { x, y, width, height } = overlay;
+  const sides = [
+    { x, y: display.y - height + 1, width, height },
+    { x, y: display.y + display.height - 1, width, height },
+    { x: display.x - width + 1, y, width, height },
+    { x: display.x + display.width - 1, y, width, height },
+  ];
+  return sides.find((r) => !others.some((o) => overlaps(r, o))) ?? null;
+}
+
 /** Physical pixels per DIP in a display's map. macOS reports DIPs; Linux is forced to scale 1 at startup. */
 const mapScale = (d: Display): number => (IS_MAC || IS_LINUX ? 1 : d.scaleFactor);
 
 /** Messages that put something new on an overlay. */
-const RAISING_CHANNELS: ReadonlySet<OverlayChannel> = new Set<OverlayChannel>(['wheel:open', 'ping:spawn', 'emote:spawn', 'toast:show', 'text:spawn']);
+const RAISING_CHANNELS: ReadonlySet<OverlayChannel> = new Set<OverlayChannel>([
+  'wheel:open', 'ping:spawn', 'emote:spawn', 'toast:show', 'text:spawn', 'mate:glow',
+]);
+
+/** The owner of the teammate's pings and emotes on every overlay. */
+const MATE = 'mate';
+/** Spec §10: the fields of one fill light up in order, this far apart. */
+const GLOW_STEP_MS = 120;
 
 /**
  * One transparent, click-through, always-on-top window per display.
  * Emits 'shared' (SharedPing) for every wheel or trigger+click ping and 'sharedEmote' (SharedEmote) for every wheel or
- * trigger+click emote, never for settings previews.
+ * trigger+click emote, never for settings previews. Ask-wheel gestures are never shared: a release on an enabled slice
+ * emits 'askRelease' (AskRelease) and an ask click 'askClick' (AskClick).
  */
 export class OverlayManager extends EventEmitter {
   readonly missingAssets = new Set<string>();
@@ -54,6 +103,12 @@ export class OverlayManager extends EventEmitter {
   private numberedList: NumberedDisplay[] = [];
   private wheelDisplay: number | null = null;
   private wheelKind: WheelKind = 'ping';
+  /** Where the open wheel was opened, in its overlay and in physical px: an ask release reports the centre. */
+  private wheelAt: { local: LocalPoint; phys: { x: number; y: number } } | null = null;
+  private mateTicket: string | null = null;
+  private captureExcluded = false;
+  /** Overlays whose page last said it has nothing on it, parked off their displays (Windows only). */
+  private readonly idleWindows = new WeakSet<BrowserWindow>();
 
   /** `resolveArt` says what an emote looks like: `remote` is true for a room member's, whose files may be missing here. */
   constructor(private settings: OverlaySettings, private readonly resolveArt: (ref: EmoteRef, remote: boolean) => EmoteArt) {
@@ -82,6 +137,19 @@ export class OverlayManager extends EventEmitter {
       // The wheel's own overlay already shows it. Another display may still hold an earlier one of ours.
       this.clearElsewhere(displayId, 'self');
     });
+    ipcMain.on(OVERLAY_IDLE, (event, idle: unknown) => {
+      // Screenshot tools on Windows take a shown overlay for a window over the whole display (#127): park an empty one.
+      if (IS_MAC || IS_LINUX || typeof idle !== 'boolean') return;
+      const displayId = this.displayOf(event.sender);
+      const win = displayId === undefined ? undefined : this.windows.get(displayId);
+      const d = screen.getAllDisplays().find((x) => x.id === displayId);
+      if (!win || win.isDestroyed() || !d) return;
+      if (idle) this.idleWindows.add(win);
+      else this.idleWindows.delete(win);
+      if (!idle && !win.isVisible()) win.showInactive(); // it had no free side to park on
+      this.place(win, d);
+      if (!idle) win.setAlwaysOnTop(true, 'screen-saver');
+    });
     this.rebuild();
     screen.on('display-added', () => this.rebuild());
     screen.on('display-removed', () => this.rebuild());
@@ -93,16 +161,28 @@ export class OverlayManager extends EventEmitter {
     for (const id of this.windows.keys()) this.send(id, 'overlay:settings', s);
   }
 
+  /**
+   * Keeps the overlays out of screen captures (WDA_EXCLUDEFROMCAPTURE) while the teammate grabs the screen, so its
+   * image shows no lolPing pings or wheels. Windows only: the macOS capture leaves lolPing's windows out by itself.
+   */
+  setCaptureExcluded(on: boolean): void {
+    if (IS_MAC || IS_LINUX) return;
+    this.captureExcluded = on;
+    for (const w of this.windows.values()) if (!w.isDestroyed()) w.setContentProtection(on);
+  }
+
   handle(ev: HelperEvent): void {
     // A wheel or a click is placed from screen coordinates, so stale display info would clip or misplace it.
-    if (ev.type === 'wheelOpen' || ev.type === 'click') this.refreshDisplays();
+    if (ev.type === 'wheelOpen' || ev.type === 'click' || ev.type === 'askWords') this.refreshDisplays();
     switch (ev.type) {
       case 'wheelOpen': {
         const p = physicalToLocal(ev.x, ev.y, this.maps);
         if (!p) return;
         this.wheelDisplay = p.displayId;
-        this.wheelKind = ev.wheel;
-        this.send(p.displayId, 'wheel:open', { x: p.x, y: p.y, wheel: ev.wheel });
+        // With the ask key on the ping key, the ping wheel is the ask wheel.
+        this.wheelKind = ev.wheel === 'ping' && this.settings.ask.onPing ? 'ask' : ev.wheel;
+        this.wheelAt = { local: p, phys: { x: ev.x, y: ev.y } };
+        this.send(p.displayId, 'wheel:open', { x: p.x, y: p.y, wheel: this.wheelKind });
         break;
       }
       case 'wheelMove':
@@ -111,12 +191,21 @@ export class OverlayManager extends EventEmitter {
         const p = physicalToLocal(ev.x, ev.y, this.maps, this.wheelDisplay);
         if (!p) return;
         this.send(p.displayId, ev.type === 'wheelMove' ? 'wheel:move' : 'wheel:release', { x: p.x, y: p.y, wheel: this.wheelKind });
-        if (ev.type === 'wheelRelease') this.wheelDisplay = null;
+        if (ev.type === 'wheelRelease') {
+          if (this.wheelKind === 'ask') this.askReleased(p);
+          this.wheelDisplay = null;
+          this.wheelAt = null;
+        }
         break;
       }
       case 'click': {
         const p = physicalToLocal(ev.x, ev.y, this.maps);
         if (!p) break;
+        const ask = ev.wheel === 'ask' || (ev.wheel === 'ping' && this.settings.ask.onPing && this.settings.ask.click);
+        if (ask) {
+          this.emit('askClick', { displayId: p.displayId, x: p.x, y: p.y, phys: { x: ev.x, y: ev.y } } satisfies AskClick);
+          break;
+        }
         if (ev.wheel === 'emote') {
           const ref = this.settings.clickEmoteId;
           this.send(p.displayId, 'emote:spawn', { owner: 'self', art: this.resolveArt(ref, false), x: p.x, y: p.y });
@@ -124,10 +213,13 @@ export class OverlayManager extends EventEmitter {
           this.emit('sharedEmote', { ref, displayId: p.displayId, x: p.x, y: p.y } satisfies SharedEmote);
           break;
         }
-        const keep = this.settings.keepLastPing ? { keep: true } : {};
-        this.send(p.displayId, 'ping:spawn', { id: this.settings.clickPingId, x: p.x, y: p.y, ...keep });
-        this.unkeepElsewhere(p.displayId);
-        this.emit('shared', { id: this.settings.clickPingId, displayId: p.displayId, x: p.x, y: p.y } satisfies SharedPing);
+        this.placeOwnPing(this.settings.clickPingId, p);
+        break;
+      }
+      case 'askWords': {
+        // A double tap of the ask key is an ask click that has no button to press.
+        const p = physicalToLocal(ev.x, ev.y, this.maps);
+        if (p) this.emit('askClick', { displayId: p.displayId, x: p.x, y: p.y, phys: { x: ev.x, y: ev.y } } satisfies AskClick);
         break;
       }
       case 'cancel':
@@ -146,6 +238,88 @@ export class OverlayManager extends EventEmitter {
   /** A room member's ping, already mapped onto one of our displays. */
   spawnRemote(p: { displayId: number; x: number; y: number; id: PingId; tag: PingTag }): void {
     this.send(p.displayId, 'ping:spawn', { id: p.id, x: p.x, y: p.y, tag: p.tag });
+  }
+
+  /** The ask now running. The teammate's marks sent after this carry it, so an overlay drops any from an older ask. */
+  setMateTicket(id: string): void {
+    this.mateTicket = id;
+    for (const displayId of this.windows.keys()) this.send(displayId, 'mate:ticket', { id });
+  }
+
+  /**
+   * One of the teammate's pings, already mapped onto one of our displays. Never shared with a room.
+   * `keep`: stays until clearMate or fadeMate (the receipt). It never touches the user's own kept ping.
+   */
+  spawnMate(p: {
+    displayId: number; x: number; y: number; id: PingId; label?: string; thinking?: boolean;
+    silent?: boolean; keep?: boolean; tagOnly?: boolean; tag: PingTag;
+  }): void {
+    const { displayId, ...ping } = p;
+    const ticket = this.mateTicket === null ? {} : { ticket: this.mateTicket };
+    this.send(displayId, 'ping:spawn', { ...ping, owner: MATE, ...ticket });
+  }
+
+  /** The teammate's emote (a bundled slug), replacing its earlier one on any display. `keep`: as in spawnMate. */
+  spawnMateEmote(p: { displayId: number; x: number; y: number; slug: string; keep?: boolean; tag: PingTag }): void {
+    const ticket = this.mateTicket === null ? {} : { ticket: this.mateTicket };
+    const keep = p.keep ? { keep: true } : {};
+    this.send(p.displayId, 'emote:spawn', {
+      owner: MATE, art: { kind: 'bundled', slug: p.slug }, x: p.x, y: p.y, tag: p.tag, ...keep, ...ticket,
+    });
+    this.clearElsewhere(p.displayId, MATE);
+  }
+
+  /** Removes the teammate's pings and emotes on every display at once. */
+  clearMate(): void {
+    for (const id of this.windows.keys()) this.send(id, 'mate:clear', null);
+  }
+
+  /** Fades the teammate's pings and emotes out on every display. */
+  fadeMate(): void {
+    for (const id of this.windows.keys()) this.send(id, 'mate:fade', null);
+  }
+
+  /** The teammate said its first line: the thinking dots on its tags stop. */
+  mateSaid(): void {
+    for (const id of this.windows.keys()) this.send(id, 'mate:said', null);
+  }
+
+  /** Outlines the fields the teammate just wrote (boxes in physical px) in its tag's colour, one after another. */
+  glow(boxes: readonly Rect[], tag: PingTag): void {
+    // The boxes are mapped before anything is sent, so the maps must be current first.
+    this.refreshDisplays();
+    const ticket = this.mateTicket === null ? {} : { ticket: this.mateTicket };
+    boxes.forEach((box, i) => {
+      const at = physicalBoxToLocal(box, this.maps);
+      if (!at) return;
+      this.send(at.displayId, 'mate:glow', {
+        box: { x: at.x, y: at.y, w: at.w, h: at.h }, color: tag.color, rgb: tag.rgb ?? null, delay: i * GLOW_STEP_MS,
+        ...ticket,
+      });
+    });
+  }
+
+  /** The display under a physical point, with its rect in physical px. */
+  displayAt(phys: { x: number; y: number }): { id: number; rect: Rect } | null {
+    const d = displayAtPhysical(phys.x, phys.y, this.maps);
+    return d ? { id: d.id, rect: { x: d.phys.x, y: d.phys.y, w: d.phys.width, h: d.phys.height } } : null;
+  }
+
+  /** A physical point in CSS px inside the overlay of the display under it. */
+  toLocal(phys: { x: number; y: number }): LocalPoint | null {
+    return physicalToLocal(phys.x, phys.y, this.maps);
+  }
+
+  /** A physical point as a screen point in DIPs, where the teammate's windows are placed. */
+  toDip(phys: { x: number; y: number }): { x: number; y: number } | null {
+    const p = physicalToDip(phys.x, phys.y, this.maps);
+    return p ? { x: p.x, y: p.y } : null;
+  }
+
+  /** The middle of the main display in DIPs: where the teammate's windows go when no display is under a spot. */
+  primaryDip(): { x: number; y: number } {
+    const b = screen.getPrimaryDisplay().bounds;
+    return { x: b.x + b.width / 2, y: b.y + b.height / 2 };
   }
 
   /** Shows an emote in the middle of the main display, without sharing it (the settings page's preview). */
@@ -195,6 +369,31 @@ export class OverlayManager extends EventEmitter {
     if (this.wheelDisplay === null) return;
     this.send(this.wheelDisplay, 'wheel:cancel', null);
     this.wheelDisplay = null;
+    this.wheelAt = null;
+  }
+
+  /** Our own ping placed from here, kept if that setting is on, and shared with the room. */
+  private placeOwnPing(id: PingId, p: LocalPoint): void {
+    const keep = this.settings.keepLastPing ? { keep: true } : {};
+    this.send(p.displayId, 'ping:spawn', { id, x: p.x, y: p.y, ...keep });
+    this.unkeepElsewhere(p.displayId);
+    this.emit('shared', { id, displayId: p.displayId, x: p.x, y: p.y } satisfies SharedPing);
+  }
+
+  /** The slice is worked out here from the same geometry the wheel draws, so the overlay has nothing to report. */
+  private askReleased(at: LocalPoint): void {
+    const open = this.wheelAt;
+    if (!open || open.local.displayId !== at.displayId) return;
+    const slice = pickSlice(at.x - open.local.x, at.y - open.local.y, (WHEEL.innerR * this.settings.wheelSizePx) / WHEEL.size);
+    const id = slice >= 0 ? this.settings.wheel[slice] : undefined;
+    if (id === undefined) return;
+    if (this.settings.ask.disabled.includes(id)) {
+      // On the ping key a switched-off intent is just a ping, as it was before the teammate.
+      if (this.settings.ask.onPing) this.placeOwnPing(id, open.local);
+      return;
+    }
+    const { displayId, x, y } = open.local;
+    this.emit('askRelease', { displayId, x, y, phys: open.phys, id } satisfies AskRelease);
   }
 
   private displayOf(sender: WebContents): number | undefined {
@@ -248,7 +447,7 @@ export class OverlayManager extends EventEmitter {
     }
     for (const d of displays) {
       const win = this.windows.get(d.id);
-      if (win) win.setBounds(overlayBounds(d));
+      if (win) this.place(win, d);
       else this.windows.set(d.id, this.createWindow(d));
     }
   }
@@ -280,6 +479,7 @@ export class OverlayManager extends EventEmitter {
     });
     win.setIgnoreMouseEvents(true);
     win.setAlwaysOnTop(true, 'screen-saver');
+    if (this.captureExcluded) win.setContentProtection(true);
     if (IS_LINUX) win.setVisibleOnAllWorkspaces(true);
     if (IS_MAC) {
       win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true, skipTransformProcessType: true });
@@ -288,10 +488,22 @@ export class OverlayManager extends EventEmitter {
     win.webContents.on('did-finish-load', () => win.webContents.send('overlay:settings', this.settings));
     win.once('ready-to-show', () => {
       win.showInactive();
-      win.setBounds(overlayBounds(d)); // re-apply: mixed-DPI setups can size the first frame wrong
+      this.place(win, d); // re-apply: mixed-DPI setups can size the first frame wrong
     });
     void loadPage(win, 'overlay');
     return win;
+  }
+
+  /** Over its display, or parked off it while its page has nothing on it (Windows only). */
+  private place(win: BrowserWindow, d: Display): void {
+    if (!this.idleWindows.has(win)) {
+      win.setBounds(overlayBounds(d));
+      return;
+    }
+    const others = screen.getAllDisplays().filter((o) => o.id !== d.id).map((o) => o.bounds);
+    const parked = parkedBounds(d.bounds, overlayBounds(d), others);
+    if (parked) win.setBounds(parked);
+    else win.hide(); // boxed in by other displays: hidden instead, show animation and all
   }
 
   private send<C extends OverlayChannel>(displayId: number, channel: C, payload: OverlayEvents[C]): void {

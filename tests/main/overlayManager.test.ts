@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { parkedBounds } from '../../src/main/overlayManager';
 import type { EmoteArt } from '../../src/shared/emotes';
-import { OVERLAY_EMOTED, OVERLAY_PINGED } from '../../src/shared/ipc';
+import { OVERLAY_EMOTED, OVERLAY_IDLE, OVERLAY_PINGED } from '../../src/shared/ipc';
 import { DEFAULT_SETTINGS, overlaySettings } from '../../src/shared/settings';
 
 type Rect = { x: number; y: number; width: number; height: number };
@@ -19,6 +20,8 @@ const h = vi.hoisted(() => {
       webContents: { send: ReturnType<typeof vi.fn> };
       onTop: string[];
       hiddenInMissionControl: boolean;
+      contentProtection: boolean[];
+      visible: boolean;
     }>,
     handlers: new Map<string, (event: unknown, raw: unknown) => void>(),
     isMac: false,
@@ -62,10 +65,24 @@ vi.mock('electron', async () => {
     setHiddenInMissionControl(hidden: boolean): void {
       this.hiddenInMissionControl = hidden;
     }
+    /** Every setContentProtection call, in order. */
+    contentProtection: boolean[] = [];
+    setContentProtection(on: boolean): void {
+      this.contentProtection.push(on);
+    }
     setBounds(r: Rect): void {
       this.bounds = r;
     }
-    showInactive(): void {}
+    visible = false;
+    showInactive(): void {
+      this.visible = true;
+    }
+    hide(): void {
+      this.visible = false;
+    }
+    isVisible(): boolean {
+      return this.visible;
+    }
     isDestroyed(): boolean {
       return false;
     }
@@ -161,6 +178,205 @@ describe('OverlayManager emote clicks', () => {
     expect(sent(1)).toEqual([]);
     expect(emoted).not.toHaveBeenCalled();
     expect(pinged).toHaveBeenCalledOnce();
+  });
+});
+
+describe('OverlayManager ask wheel', () => {
+  const askOn = (intents: object = {}) => mgr.updateSettings(overlaySettings({
+    ...DEFAULT_SETTINGS, features: { ...DEFAULT_SETTINGS.features, teammate: true },
+    teammate: { ...DEFAULT_SETTINGS.teammate, intents },
+  }));
+
+  it('reports an ask release without sharing it with the room', () => {
+    askOn();
+    const shared = vi.fn();
+    const asked = vi.fn();
+    mgr.on('shared', shared);
+    mgr.on('sharedEmote', shared);
+    mgr.on('askRelease', asked);
+    mgr.handle({ type: 'wheelOpen', x: 1920 + 500, y: 500, wheel: 'ask' });
+    mgr.handle({ type: 'wheelMove', x: 1920 + 500, y: 380, wheel: 'ask' });
+    mgr.handle({ type: 'wheelRelease', x: 1920 + 500, y: 360, wheel: 'ask' });
+    expect(sent(1)).toEqual([
+      ['wheel:open', { x: 500, y: 500, wheel: 'ask' }],
+      ['wheel:move', { x: 500, y: 380, wheel: 'ask' }],
+      ['wheel:release', { x: 500, y: 360, wheel: 'ask' }],
+    ]);
+    expect(asked).toHaveBeenCalledExactlyOnceWith({ displayId: 2, x: 500, y: 500, phys: { x: 1920 + 500, y: 500 }, id: 'danger' });
+    expect(shared).not.toHaveBeenCalled();
+  });
+
+  it('ignores a release on a switched-off intent', () => {
+    askOn({ danger: { enabled: false } });
+    const asked = vi.fn();
+    mgr.on('askRelease', asked);
+    mgr.handle({ type: 'wheelOpen', x: 500, y: 500, wheel: 'ask' });
+    mgr.handle({ type: 'wheelRelease', x: 500, y: 360, wheel: 'ask' });
+    mgr.handle({ type: 'wheelOpen', x: 500, y: 500, wheel: 'ask' });
+    mgr.handle({ type: 'wheelRelease', x: 500, y: 490, wheel: 'ask' }); // the dead zone
+    expect(asked).not.toHaveBeenCalled();
+    mgr.handle({ type: 'wheelOpen', x: 500, y: 500, wheel: 'ask' });
+    mgr.handle({ type: 'wheelRelease', x: 640, y: 500, wheel: 'ask' }); // east: the third slice
+    expect(asked).toHaveBeenCalledExactlyOnceWith({ displayId: 1, x: 500, y: 500, phys: { x: 500, y: 500 }, id: 'omw' });
+  });
+
+  describe('on the ping key', () => {
+    const sameKey = (o: { intents?: object; askClick?: boolean } = {}) => mgr.updateSettings(overlaySettings({
+      ...DEFAULT_SETTINGS, features: { ...DEFAULT_SETTINGS.features, teammate: true },
+      teammate: { ...DEFAULT_SETTINGS.teammate, askTrigger: 'same', intents: o.intents ?? {}, askClick: o.askClick ?? true },
+    }));
+
+    it('asks with a ping-wheel release and shares nothing with the room', () => {
+      sameKey();
+      const shared = vi.fn();
+      const asked = vi.fn();
+      mgr.on('shared', shared);
+      mgr.on('askRelease', asked);
+      mgr.handle({ type: 'wheelOpen', x: 500, y: 500, wheel: 'ping' });
+      mgr.handle({ type: 'wheelRelease', x: 500, y: 360, wheel: 'ping' });
+      expect(sent(0)).toEqual([
+        ['wheel:open', { x: 500, y: 500, wheel: 'ask' }],
+        ['wheel:release', { x: 500, y: 360, wheel: 'ask' }],
+      ]);
+      expect(asked).toHaveBeenCalledExactlyOnceWith({ displayId: 1, x: 500, y: 500, phys: { x: 500, y: 500 }, id: 'danger' });
+      expect(shared).not.toHaveBeenCalled();
+    });
+
+    it('keeps a switched-off intent a normal ping for the room', () => {
+      sameKey({ intents: { danger: { enabled: false } } });
+      const shared = vi.fn();
+      const asked = vi.fn();
+      mgr.on('shared', shared);
+      mgr.on('askRelease', asked);
+      mgr.handle({ type: 'wheelOpen', x: 500, y: 500, wheel: 'ping' });
+      mgr.handle({ type: 'wheelRelease', x: 500, y: 360, wheel: 'ping' });
+      expect(asked).not.toHaveBeenCalled();
+      expect(sent(0).at(-1)).toEqual(['ping:spawn', { id: 'danger', x: 500, y: 500 }]);
+      expect(shared).toHaveBeenCalledExactlyOnceWith({ id: 'danger', displayId: 1, x: 500, y: 500 });
+    });
+
+    it('opens the words box for a ping click while ask with words is on, and pings otherwise', () => {
+      sameKey();
+      const shared = vi.fn();
+      const clicked = vi.fn();
+      mgr.on('shared', shared);
+      mgr.on('askClick', clicked);
+      mgr.handle({ type: 'click', x: 30, y: 40, wheel: 'ping' });
+      expect(clicked).toHaveBeenCalledExactlyOnceWith({ displayId: 1, x: 30, y: 40, phys: { x: 30, y: 40 } });
+      expect(shared).not.toHaveBeenCalled();
+      sameKey({ askClick: false });
+      mgr.handle({ type: 'click', x: 30, y: 40, wheel: 'ping' });
+      expect(clicked).toHaveBeenCalledOnce();
+      expect(shared).toHaveBeenCalledOnce();
+    });
+  });
+
+  it('opens the words box at the pointer on a double tap', () => {
+    askOn();
+    const clicked = vi.fn();
+    mgr.on('askClick', clicked);
+    mgr.handle({ type: 'askWords', x: 1920 + 30, y: 40 });
+    expect(clicked).toHaveBeenCalledExactlyOnceWith({ displayId: 2, x: 30, y: 40, phys: { x: 1920 + 30, y: 40 } });
+    expect(sent(0)).toEqual([]);
+    expect(sent(1)).toEqual([]);
+  });
+
+  it('reports an ask click without sharing it or drawing a ping', () => {
+    askOn();
+    const shared = vi.fn();
+    const clicked = vi.fn();
+    mgr.on('shared', shared);
+    mgr.on('sharedEmote', shared);
+    mgr.on('askClick', clicked);
+    mgr.handle({ type: 'click', x: 1920 + 30, y: 40, wheel: 'ask' });
+    expect(clicked).toHaveBeenCalledExactlyOnceWith({ displayId: 2, x: 30, y: 40, phys: { x: 1920 + 30, y: 40 } });
+    expect(shared).not.toHaveBeenCalled();
+    expect(sent(0)).toEqual([]);
+    expect(sent(1)).toEqual([]);
+  });
+
+  it('draws the teammate\'s pings and emotes with its tag, and clears or fades them everywhere', () => {
+    const tag = { name: 'AI', color: 3 };
+    mgr.spawnMate({ displayId: 2, x: 10, y: 20, id: 'danger', label: 'typo', silent: true, tag });
+    mgr.spawnMateEmote({ displayId: 1, x: 5, y: 6, slug: 'okay', tag });
+    mgr.clearMate();
+    mgr.fadeMate();
+    expect(sent(1)).toEqual([
+      ['ping:spawn', { id: 'danger', x: 10, y: 20, owner: 'mate', label: 'typo', silent: true, tag }],
+      ['emote:clear', { owner: 'mate' }],
+      ['mate:clear', null],
+      ['mate:fade', null],
+    ]);
+    expect(sent(0)).toEqual([
+      ['emote:spawn', { owner: 'mate', art: { kind: 'bundled', slug: 'okay' }, x: 5, y: 6, tag }],
+      ['mate:clear', null],
+      ['mate:fade', null],
+    ]);
+  });
+
+  it('sends a kept teammate emote with keep, for the overlay to hold until it fades', () => {
+    const tag = { name: 'AI', color: 3 };
+    mgr.spawnMateEmote({ displayId: 1, x: 5, y: 6, slug: 'okay', keep: true, tag });
+    expect(sent(0)).toEqual([
+      ['emote:spawn', { owner: 'mate', art: { kind: 'bundled', slug: 'okay' }, x: 5, y: 6, tag, keep: true }],
+    ]);
+  });
+
+  it('stamps the teammate\'s pings with the current ask\'s ticket', () => {
+    const tag = { name: 'AI', color: 3 };
+    mgr.setMateTicket('t1');
+    mgr.spawnMate({ displayId: 1, x: 1, y: 2, id: 'push', tag });
+    expect(sent(0)).toEqual([
+      ['mate:ticket', { id: 't1' }],
+      ['ping:spawn', { id: 'push', x: 1, y: 2, owner: 'mate', tag, ticket: 't1' }],
+    ]);
+    expect(sent(1)).toEqual([['mate:ticket', { id: 't1' }]]);
+  });
+
+  it('keeps the receipt and draws a tag-only one, and stops every tag’s dots once the teammate speaks', () => {
+    const tag = { name: 'AI', color: 3 };
+    mgr.spawnMate({ displayId: 1, x: 1, y: 2, id: 'omw', thinking: true, keep: true, tagOnly: true, tag });
+    mgr.mateSaid();
+    expect(sent(0)).toEqual([
+      ['ping:spawn', { id: 'omw', x: 1, y: 2, thinking: true, keep: true, tagOnly: true, owner: 'mate', tag }],
+      ['mate:said', null],
+    ]);
+    expect(sent(1)).toEqual([['mate:said', null]]);
+  });
+
+  it('outlines each field the teammate wrote on its own display, in order and 120 ms apart', () => {
+    // No gesture picks up the new scale first: the glow checks the displays itself.
+    h.displays[1].scaleFactor = 2;
+    mgr.setMateTicket('t1');
+    mgr.glow([
+      { x: 1920 + 100, y: 200, w: 300, h: 30 },
+      { x: 100, y: 200, w: 300, h: 30 },
+      { x: 100, y: 260, w: 300, h: 30 },
+    ], { name: 'AI', color: 3, rgb: [10, 20, 30] });
+    const glows = (i: number): unknown[] => sent(i).filter((m) => m[0] === 'mate:glow').map((m) => m[1]);
+    // Display 2 is at 200 %: its overlay's CSS px are half the physical px.
+    expect(glows(1)).toEqual([
+      { box: { x: 50, y: 100, w: 150, h: 15 }, color: 3, rgb: [10, 20, 30], delay: 0, ticket: 't1' },
+    ]);
+    expect(glows(0)).toEqual([
+      { box: { x: 100, y: 200, w: 300, h: 30 }, color: 3, rgb: [10, 20, 30], delay: 120, ticket: 't1' },
+      { box: { x: 100, y: 260, w: 300, h: 30 }, color: 3, rgb: [10, 20, 30], delay: 240, ticket: 't1' },
+    ]);
+  });
+
+  it('maps a physical point to a screen point in DIPs for the teammate’s windows', () => {
+    h.displays[1].scaleFactor = 2;
+    mgr.handle({ type: 'wheelOpen', x: 10, y: 10, wheel: 'ping' }); // the next gesture picks up the new scale
+    expect(mgr.toDip({ x: 1920 + 100, y: 60 })).toEqual({ x: 1920 + 50, y: 30 });
+  });
+
+  it('falls back to the middle of the main display for the teammate\'s windows', () => {
+    expect(mgr.primaryDip()).toEqual({ x: 960, y: 540 });
+  });
+
+  it('finds the display under a physical point and maps it into that overlay', () => {
+    expect(mgr.displayAt({ x: 1920 + 10, y: 10 })).toEqual({ id: 2, rect: { x: 1920, y: 0, w: 1280, h: 1024 } });
+    expect(mgr.toLocal({ x: 1920 + 10, y: 30 })).toEqual({ displayId: 2, x: 10, y: 30 });
   });
 });
 
@@ -413,5 +629,126 @@ describe('OverlayManager z-order', () => {
     mac.handle({ type: 'wheelOpen', x: 100, y: 200, wheel: 'ping' });
     mac.previewPing('danger');
     expect(raised()).toEqual([[], []]);
+  });
+});
+
+describe('parkedBounds', () => {
+  const display = { x: 0, y: 0, width: 1920, height: 1080 };
+  const overlay = { x: 0, y: 0, width: 1920, height: 1079 };
+
+  it('moves the overlay above its display, leaving one DIP on it so it keeps that display’s scale', () => {
+    expect(parkedBounds(display, overlay, [{ x: 1920, y: 0, width: 1280, height: 1024 }]))
+      .toEqual({ x: 0, y: -1078, width: 1920, height: 1079 });
+  });
+
+  it('goes below, left or right when the side before it borders another display', () => {
+    const above = { x: 0, y: -1080, width: 1920, height: 1080 };
+    const below = { x: 0, y: 1080, width: 1920, height: 1080 };
+    const left = { x: -1920, y: 0, width: 1920, height: 1080 };
+    expect(parkedBounds(display, overlay, [above])).toEqual({ x: 0, y: 1079, width: 1920, height: 1079 });
+    expect(parkedBounds(display, overlay, [above, below])).toEqual({ x: -1919, y: 0, width: 1920, height: 1079 });
+    expect(parkedBounds(display, overlay, [above, below, left])).toEqual({ x: 1919, y: 0, width: 1920, height: 1079 });
+  });
+
+  it('gives up when every side borders another display', () => {
+    const around = [
+      { x: 0, y: -1080, width: 1920, height: 1080 }, { x: 0, y: 1080, width: 1920, height: 1080 },
+      { x: -1920, y: 0, width: 1920, height: 1080 }, { x: 1920, y: 0, width: 1920, height: 1080 },
+    ];
+    expect(parkedBounds(display, overlay, around)).toBeNull();
+  });
+});
+
+describe('OverlayManager idle windows', () => {
+  const idle = (i: number, value: unknown): void => h.handlers.get(OVERLAY_IDLE)!({ sender: h.windows[i].webContents }, value);
+  const shownAtStart = (): void => {
+    for (const w of h.windows) w.emit('ready-to-show');
+  };
+  const parked = { x: 0, y: -1078, width: 1920, height: 1079 };
+  const overDisplay = { x: 0, y: 0, width: 1920, height: 1079 };
+
+  it('parks an empty overlay on Windows off its display, shown, so screenshot tools see the windows under it', () => {
+    shownAtStart();
+    idle(0, true);
+    expect(h.windows.map((w) => w.visible)).toEqual([true, true]);
+    expect(h.windows[0].bounds).toEqual(parked);
+    expect(h.windows[1].bounds).toEqual({ x: 1920, y: 0, width: 1280, height: 1023 });
+  });
+
+  it('puts it back over its display, back on top, as soon as its page draws something', () => {
+    shownAtStart();
+    idle(0, true);
+    const levels = h.windows[0].onTop.length;
+    idle(0, false);
+    expect(h.windows[0].bounds).toEqual(overDisplay);
+    expect(h.windows[0].onTop.slice(levels)).toEqual(['screen-saver']);
+  });
+
+  it('parks an overlay whose page said it was empty before the window was ready to show', () => {
+    idle(0, true);
+    shownAtStart();
+    expect(h.windows[0].visible).toBe(true);
+    expect(h.windows[0].bounds).toEqual(parked);
+  });
+
+  it('keeps a parked overlay parked when the displays change under it', () => {
+    shownAtStart();
+    idle(0, true);
+    h.setDisplayBounds(1, { height: 1200 });
+    mgr.toast('t', 'b'); // something new to draw makes the manager notice; the page has not drawn it yet
+    expect(h.windows[0].bounds).toEqual({ x: 0, y: -1198, width: 1920, height: 1199 });
+  });
+
+  it('ignores a malformed report', () => {
+    shownAtStart();
+    idle(0, 'yes');
+    idle(0, 1);
+    expect(h.windows[0].bounds).toEqual(overDisplay);
+  });
+
+  it('leaves the overlays over their displays on macOS and Linux', async () => {
+    for (const platform of ['mac', 'linux'] as const) {
+      h.windows.length = 0;
+      h.handlers.clear();
+      h.isMac = platform === 'mac';
+      h.isLinux = platform === 'linux';
+      vi.resetModules();
+      const { OverlayManager } = await import('../../src/main/overlayManager');
+      new OverlayManager(overlaySettings(DEFAULT_SETTINGS), resolveArt).start();
+      shownAtStart();
+      idle(0, true);
+      expect(h.windows[0].bounds).toEqual({ x: 0, y: 0, width: 1920, height: 1080 });
+    }
+  });
+});
+
+describe('OverlayManager capture exclusion', () => {
+  it('keeps every overlay out of a capture on Windows and lets them back in after', () => {
+    mgr.setCaptureExcluded(true);
+    expect(h.windows.map((w) => w.contentProtection)).toEqual([[true], [true]]);
+    mgr.setCaptureExcluded(false);
+    expect(h.windows.map((w) => w.contentProtection)).toEqual([[true, false], [true, false]]);
+  });
+
+  it('excludes an overlay built for a display that appears mid-capture', () => {
+    mgr.setCaptureExcluded(true);
+    h.displays.push({ id: 3, bounds: { x: 3200, y: 0, width: 800, height: 600 }, scaleFactor: 1 });
+    mgr.handle({ type: 'wheelOpen', x: 10, y: 10, wheel: 'ping' }); // the next gesture finds the new display
+    expect(h.windows).toHaveLength(3);
+    expect(h.windows[2].contentProtection).toEqual([true]);
+  });
+
+  it('leaves the overlays alone on macOS and Linux, whose capture leaves lolPing out by itself', async () => {
+    for (const platform of ['mac', 'linux'] as const) {
+      h.windows.length = 0;
+      h.isMac = platform === 'mac';
+      h.isLinux = platform === 'linux';
+      vi.resetModules();
+      const { OverlayManager } = await import('../../src/main/overlayManager');
+      const other = new OverlayManager(overlaySettings(DEFAULT_SETTINGS), resolveArt);
+      other.start();
+      other.setCaptureExcluded(true);
+      expect(h.windows.map((w) => w.contentProtection)).toEqual([[], []]);
+    }
   });
 });

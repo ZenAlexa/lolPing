@@ -224,6 +224,38 @@ describe('members', () => {
     expect(toasts.at(-1)).toEqual({ kind: 'disconnected', name: 'Alex' });
   });
 
+  it('brings a member back quietly when the same peer ID returns after a timeout', async () => {
+    await joinActive();
+    const alex = new Remote('1111111111111111', 'lan:a', lan);
+    alex.presence({ name: 'Alex' });
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(toasts.map((t) => t.kind)).toEqual(['joinedRoom', 'joined', 'disconnected']);
+    alex.presence({ name: 'Alex' }); // the same app, awake again
+    expect(room.state().members.map((m) => m.name)).toEqual(['Me', 'Alex']);
+    expect(toasts.map((t) => t.kind)).toEqual(['joinedRoom', 'joined', 'disconnected']);
+  });
+
+  it('says "disconnected" once for a member that keeps dropping out, and still says when it leaves', async () => {
+    await joinActive();
+    const alex = new Remote('1111111111111111', 'lan:a', lan);
+    alex.presence({ name: 'Alex' });
+    await vi.advanceTimersByTimeAsync(15_000);
+    alex.presence({ name: 'Alex' }); // a sleeping laptop that wakes now and then
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(room.state().members).toHaveLength(1);
+    alex.presence({ name: 'Alex' });
+    alex.bye();
+    expect(toasts.map((t) => t.kind)).toEqual(['joinedRoom', 'joined', 'disconnected', 'left']);
+  });
+
+  it('announces a member that comes back under a new peer ID, because that one joined again', async () => {
+    await joinActive();
+    new Remote('1111111111111111', 'lan:a', lan).presence({ name: 'Alex' });
+    await vi.advanceTimersByTimeAsync(15_000);
+    new Remote('2222222222222222', 'lan:a', lan).presence({ name: 'Alex' });
+    expect(toasts.at(-1)).toEqual({ kind: 'joined', name: 'Alex' });
+  });
+
   it('gives members a fresh grace period after the computer slept, instead of "disconnected" toasts', async () => {
     await joinActive();
     new Remote('1111111111111111', 'lan:a', lan).presence({ name: 'Alex' });
